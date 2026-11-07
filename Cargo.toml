@@ -1,0 +1,27 @@
+[workspace]
+members = ["xtask", "dsp"]
+
+[package]
+name = "seedspace"
+version = "0.1.0"
+edition = "2021"
+# nih-plug's VST3 bindings (vst3-sys) are GPLv3
+license = "GPL-3.0-or-later"
+
+[lib]
+# lib is needed for the standalone binary in src/main.rs
+crate-type = ["cdylib", "lib"]
+
+[dependencies]
+seedspace_dsp = { path = "dsp" }
+# Pinned to the rev already built in ~/dev/nih-plug
+nih_plug = { git = "https://github.com/robbert-vdh/nih-plug.git", rev = "de421011f41a6d10fc8c7a6084e4f4dee0143683", features = ["assert_process_allocs", "standalone"] }
+nih_plug_egui = { git = "https://github.com/robbert-vdh/nih-plug.git", rev = "de421011f41a6d10fc8c7a6084e4f4dee0143683" }
+
+[profile.release]
+lto = "thin"
+strip = "symbols"
+
+# The DSP tests render tens of seconds of audio
+[profile.dev.package.seedspace_dsp]
+opt-level = 2
