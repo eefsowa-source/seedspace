@@ -18,7 +18,7 @@ const GRID: [f32; LINES] = [
 ];
 const PRISM_RATIOS: [f32; 6] = [2.0, 1.498_307, 0.5, 1.334_84, 2.996_614, -1.0];
 const MINOR_PENTATONIC: [i32; 5] = [0, 3, 5, 7, 10];
-// Hadamard rows are orthonormal, so the shimmer and tune paths can never add energy to each other.
+// Hadamard rows are orthonormal: each shimmer voice and each comb hears its own mix of the lines.
 const SHIMMER_ROWS: [usize; 2] = [1, 2];
 const TUNE_ROWS: [usize; COMBS] = [0, 3, 4, 5, 6, 7];
 
@@ -36,11 +36,17 @@ const DIFFUSER_MAX_MS: f32 = 20.0;
 const PRISM_MS: f32 = 60.0;
 const REVERSE_MS: f32 = 180.0;
 const PRISM_FADE: f32 = 0.25;
-// Random grain start, as a share of the window.
-const SHIFT_JITTER: f32 = 0.25;
-const TUNE_MAX: f32 = 0.3;
-// A comb at peak gain 1 only returns what its row carried, so the chord needs a path out of the loop.
+// How far a splice may slide to find its match: one period of 67 Hz.
+const SPLICE_MS: f32 = 15.0;
+const SPLICE_POINTS: usize = 64;
+const SPLICE_LAGS: usize = 96;
+// An upward shift lands below this share of Tone, a downward one above this multiple of Low Cut.
+const LAND_HIGH: f32 = 0.25;
+const LAND_LOW: f32 = 2.0;
+// The combs only listen to the loop, so Tune never shortens the tail; this is the chord's way out.
 const TUNE_OUT: f32 = 16.0;
+// Line level left at full Tune, so the chord takes over from the room instead of piling on top.
+const TUNE_ROOM: f32 = 0.45;
 // Per comb, because a steady tone exactly on a note would otherwise jump 18 dB out of the wet.
 const TUNE_CEILING: f32 = 0.25;
 const TUNE_MIN_HZ: f32 = 50.0;
@@ -54,15 +60,13 @@ const OUT_GAIN: f32 = 2.0;
 const LIMIT_KNEE: f32 = 0.5;
 // Share of the shifter cycle spent crossfading.
 const SHIFT_FADE: f32 = 0.3;
-// Average power of two uncorrelated taps: 3/4 inside sin² crossfades, 1 outside.
-const SHIFT_ENERGY: f32 = 1.0 - 0.25 * SHIFT_FADE;
-// Measured: rows mix only partly per pass, while Prism also cascades out through Tone and Low Cut.
-const DECAY_MAKEUP: f32 = 0.7;
-const PRISM_MAKEUP: f32 = 3.0;
-// A mode the sounds never touch rings at most this many times Decay.
-const MAKEUP_RING: f32 = 4.0;
-// Full compensation flattens sustained level but buries hits at long Decay; 0.4 splits the difference.
-const COMP_DEPTH: f32 = 0.4;
+// Amount over which a shifter fades in from its untouched input.
+const SHIFT_ENTRY: f32 = 0.05;
+// Fast input follower as a share of the mean loop time: shorter passes hits louder, longer evens out
+// a run of hits better. At 0.5 a lone hit loses under 2 dB and a drum loop runs at most 3 dB hot.
+const COMP_FAST: f32 = 0.5;
+// Measured: white noise fills the loop less than the model says, because its highs die sooner.
+const COMP_DEPTH: f32 = 0.8;
 
 /// Control snapshot in plain units. The wrapper resolves tempo sync into `size_ms`.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -256,6 +260,11 @@ fn tone_pole(hz: f32, sr: f32) -> f32 {
     ((pole(hz, sr) - open) / (1.0 - open)).max(0.0)
 }
 
+/// Crossover of a shifter, placed so the shifted band lands inside the audible range.
+fn land(ratio: f32, p: &EngineParams) -> f32 {
+    (if ratio > 1.0 { LAND_HIGH * p.tone_hz } else { LAND_LOW * p.low_cut_hz }) / ratio.abs()
+}
+
 fn time_coef(ms: f32, sr: f32) -> f32 {
     (-1.0 / (ms * 0.001 * sr).max(1.0)).exp()
 }
@@ -342,60 +351,201 @@ impl DelayLine {
         self.buf[(self.write + self.buf.len() - delay) & self.mask]
     }
 
+    /// Correlation of the audio at two delays, over points `stride` apart. Clamped to 0..1 because a
+    /// crossfade is never boosted past equal power; 1 when either side is silent.
+    fn similarity(&self, a: f32, b: f32, stride: f32) -> f32 {
+        let (mut ab, mut aa, mut bb) = (0.0f32, 0.0f32, 0.0f32);
+        for n in 0..SPLICE_POINTS {
+            let at = |delay: f32| self.read_whole((delay + n as f32 * stride) as usize);
+            let (x, y) = (at(a), at(b));
+            ab += x * y;
+            aa += x * x;
+            bb += y * y;
+        }
+        if aa * bb > 0.0 { (ab / (aa * bb).sqrt()).clamp(0.0, 1.0) } else { 1.0 }
+    }
+
     fn write(&mut self, x: f32) {
         self.buf[self.write] = x;
         self.write = (self.write + 1) & self.mask;
     }
 }
 
-/// Two-tap delay-line pitch shifter; its gains sum to 1, so path gain never exceeds 1.
+/// Third-order Butterworth crossover as the sum and difference of two allpasses: the halves keep
+/// the input's power between them, which a steeper split by subtraction would not.
+#[derive(Clone, Copy)]
+struct Split {
+    a: f32,
+    b1: f32,
+    b2: f32,
+}
+
+impl Split {
+    fn new(hz: f32, sr: f32) -> Self {
+        let k = (PI * (hz / sr).min(0.45)).tan();
+        let d = 1.0 + k + k * k;
+        Self { a: (k - 1.0) / (k + 1.0), b1: 2.0 * (k * k - 1.0) / d, b2: (1.0 - k + k * k) / d }
+    }
+
+    /// Returns (low, high).
+    fn tick(&self, x: f32, z: &mut [f32; 3]) -> (f32, f32) {
+        let one = self.a * x + z[0];
+        z[0] = x - self.a * one;
+        let two = self.b2 * x + z[1];
+        z[1] = self.b1 * x - self.b1 * two + z[2];
+        z[2] = x - self.b2 * two;
+        (0.5 * (one + two), 0.5 * (one - two))
+    }
+}
+
+/// Two-tap delay-line pitch shifter. Splices are matched by correlation and every mix keeps its power.
 struct PitchShifter {
     line: DelayLine,
     phase: f32,
+    /// Tap 0's position in its crossfade, kept to catch a tap leaving silence.
+    edge: f32,
     ratio: f32,
     window: f32,
-    /// Grain start offset per tap in samples, redrawn while that tap is silent.
+    span: f32,
+    /// Splice offset per tap in samples, chosen while that tap is silent.
     offset: [f32; 2],
-    seed: u32,
-    rng: Rng,
+    /// Correlation of the two taps at the last splice.
+    rho: f32,
+    split: Split,
+    split_z: [f32; 3],
+    fed: f32,
+    band: f32,
+    rest: f32,
+    /// Running band², shifted² and band·shifted.
+    corr: [f32; 3],
+    k_corr: f32,
 }
 
 impl PitchShifter {
-    fn new(sr: f32, ratio: f32, ms: f32, seed: u32) -> Self {
+    fn new(sr: f32, ratio: f32, ms: f32) -> Self {
         Self {
-            line: DelayLine::new((sr * REVERSE_MS * (1.0 + SHIFT_JITTER) * 0.001) as usize + 8),
+            line: DelayLine::new((sr * (REVERSE_MS + SPLICE_MS) * 0.001) as usize + 8),
             phase: 0.0,
+            edge: -1.0,
             ratio,
             window: ms * 0.001 * sr,
+            span: SPLICE_MS * 0.001 * sr,
             offset: [0.0; 2],
-            seed,
-            rng: Rng::new(seed),
+            rho: 1.0,
+            split: Split { a: 0.0, b1: 0.0, b2: 0.0 },
+            split_z: [0.0; 3],
+            fed: 0.0,
+            band: 0.0,
+            rest: 0.0,
+            corr: [0.0; 3],
+            k_corr: time_coef(50.0, sr),
         }
     }
 
     fn reset(&mut self) {
         self.line.reset();
         self.phase = 0.0;
+        self.edge = -1.0;
         self.offset = [0.0; 2];
-        self.rng = Rng::new(self.seed);
+        self.rho = 1.0;
+        self.split_z = [0.0; 3];
+        self.band = 0.0;
+        self.rest = 0.0;
+        self.corr = [0.0; 3];
     }
 
-    /// Reads after `line.write`; separate so a bypassed shifter keeps fresh audio without the reads.
+    /// Runs every sample, so a shifter that is switched in already holds fresh audio. `duck` fades the
+    /// buffer out around a seed swap: a new ratio changes which band is kept, a step the taps would replay.
+    fn feed(&mut self, x: f32, duck: f32) {
+        self.fed = x;
+        let (low, high) = self.split.tick(x, &mut self.split_z);
+        // Only the band whose shifted copy stays in range is shifted; the rest passes, so a cascade
+        // of shifts piles up at the band edge instead of leaving through Tone or Low Cut.
+        (self.band, self.rest) = if self.ratio > 1.0 {
+            (low, high)
+        } else if self.ratio > 0.0 {
+            (high, low)
+        } else {
+            (x, 0.0)
+        };
+        self.line.write(self.band * duck);
+    }
+
+    /// The last fed sample with `amount` of its band replaced by the shifted copy. The blend is scaled
+    /// back to the band's running power, so it takes nothing out of the loop; as the two line up the
+    /// scale falls to 1, so a tone that starts to ring loses the boost.
+    fn mix(&mut self, amount: f32) -> f32 {
+        let (dry, wet) = (self.band, self.read());
+        for (acc, v) in self.corr.iter_mut().zip([dry * dry, wet * wet, dry * wet]) {
+            glide(acc, v, self.k_corr);
+        }
+        let (a, b) = (1.0 - amount, amount);
+        let mixed = a * a * self.corr[0] + b * b * self.corr[1] + 2.0 * a * b * self.corr[2];
+        let keep = (self.corr[0] / (mixed + 1e-30)).sqrt().clamp(1.0, 1.0 / (a * a + b * b).sqrt());
+        let split = self.rest + (a * dry + b * wet) * keep;
+        // The two halves sum to a phase-shifted input, so the first few percent fade over from the input itself.
+        self.fed + (split - self.fed) * (amount / SHIFT_ENTRY).min(1.0)
+    }
+
+    /// Reads after `line.write`.
     fn read(&mut self) -> f32 {
-        let before = self.phase;
         self.phase = (self.phase + (1.0 - self.ratio) / self.window).rem_euclid(1.0);
         let taps = [self.phase, (self.phase + 0.5) % 1.0];
-        // A fixed grain grid puts the output on lines 1/period apart, off the true pitch; random starts smear them onto it.
-        for (k, was) in [before, (before + 0.5) % 1.0].into_iter().enumerate() {
-            if (taps[k] - was).abs() > 0.5 {
-                self.offset[k] = self.rng.next() * SHIFT_JITTER * self.window;
-            }
-        }
-        // Each tap holds full gain between sin² crossfades, so less of the time is spent in the lossy overlap.
+        // Each tap holds full gain between sin² crossfades.
         let edge = (self.phase.min(1.0 - self.phase) - 0.25 + 0.25 * SHIFT_FADE) / (0.5 * SHIFT_FADE);
-        let w = (0.5 * PI * edge.clamp(0.0, 1.0)).sin().powi(2);
+        if self.edge <= 0.0 && edge > 0.0 {
+            self.splice(0, taps);
+        } else if self.edge >= 1.0 && edge < 1.0 {
+            self.splice(1, taps);
+        }
+        self.edge = edge;
         let read = |k: usize| self.line.read(taps[k] * self.window + self.offset[k]);
-        read(0) * w + read(1) * (1.0 - w)
+        if edge <= 0.0 {
+            return read(1);
+        }
+        if edge >= 1.0 {
+            return read(0);
+        }
+        let w = (0.5 * PI * edge).sin().powi(2);
+        (read(0) * w + read(1) * (1.0 - w)) / (1.0 - 2.0 * w * (1.0 - w) * (1.0 - self.rho)).sqrt()
+    }
+
+    /// Starts tap `k` where it best matches the tap it fades in over, so tonal audio splices in phase.
+    fn splice(&mut self, k: usize, taps: [f32; 2]) {
+        let out = taps[1 - k] * self.window + self.offset[1 - k];
+        // Whole lags only: both taps then read between samples at the same fraction.
+        let first = (taps[k] * self.window - out).ceil();
+        let stride = 0.5 * SHIFT_FADE * self.window / SPLICE_POINTS as f32;
+        let at = |n: f32, lag: f32| self.line.read_whole((out - n * stride + lag) as usize);
+        let a: [f32; SPLICE_POINTS] = std::array::from_fn(|n| at(n as f32, 0.0));
+        let score = |lag: f32| {
+            let (mut ab, mut bb) = (0.0f32, 0.0f32);
+            for n in 0..SPLICE_POINTS {
+                let b = at(n as f32, lag);
+                ab += a[n] * b;
+                bb += b * b;
+            }
+            ab / (bb + 1e-30).sqrt()
+        };
+        let coarse = self.span / SPLICE_LAGS as f32;
+        let mut best = (score(first), first);
+        let consider = |best: &mut (f32, f32), lag: f32| {
+            let s = score(lag);
+            if s > best.0 {
+                *best = (s, lag);
+            }
+        };
+        for i in 1..SPLICE_LAGS {
+            consider(&mut best, first + (i as f32 * coarse).floor());
+        }
+        let around = best.1;
+        for d in -(coarse as i32)..=coarse as i32 {
+            consider(&mut best, (around + d as f32).clamp(first, first + self.span));
+        }
+        let lag = best.1;
+        // Measured on points the search never saw: the best of a hundred lags always looks correlated.
+        self.rho = self.line.similarity(out - 0.5 * stride, out + lag - 0.5 * stride, -stride);
+        self.offset[k] = out + lag - taps[k] * self.window;
     }
 }
 
@@ -430,6 +580,8 @@ struct Line {
     active: usize,
     /// Weight of the outgoing head, 1 -> 0
     fade: f32,
+    /// Correlation of the two heads at the jump.
+    rho: f32,
     jump: bool,
     target: f32,
     t60: f32,
@@ -437,6 +589,8 @@ struct Line {
     g_t: f32,
     lp: f32,
     lp_t: f32,
+    tone_hz: f32,
+    cut_hz: f32,
     lp_z: f32,
     hp: f32,
     hp_t: f32,
@@ -478,6 +632,9 @@ pub struct Engine {
     dry_mix: f32,
     comp: f32,
     comp_t: f32,
+    /// Input power over about one pass and over the time the loop takes to fill.
+    power: [f32; 2],
+    k_power: [f32; 2],
     a_s: f32,
     a_s_t: f32,
     a_t: f32,
@@ -507,11 +664,12 @@ impl Engine {
         let sr = sample_rate;
         let params = EngineParams::default();
         let line_len = (sr * max_delay_s()) as usize + 4;
-        let line = |i: usize| Line {
+        let line = |_: usize| Line {
             delay: DelayLine::new(line_len),
             heads: [Head { base: 1.0, scale: 1.0 }; 2],
             active: 0,
             fade: 0.0,
+            rho: 1.0,
             jump: false,
             target: 1.0,
             t60: 1.0,
@@ -519,13 +677,15 @@ impl Engine {
             g_t: 0.0,
             lp: 0.0,
             lp_t: 0.0,
+            tone_hz: 20_000.0,
+            cut_hz: 20.0,
             lp_z: 0.0,
             hp: 0.0,
             hp_t: 0.0,
             hp_z: 0.0,
             p: 0.0,
             p_t: 0.0,
-            shifter: PitchShifter::new(sr, 2.0, PRISM_MS, i as u32),
+            shifter: PitchShifter::new(sr, 2.0, PRISM_MS),
             walk: 0.0,
             walk_t: 0.0,
             walk_phase: 0.0,
@@ -546,7 +706,7 @@ impl Engine {
                 std::array::from_fn(|_| DelayLine::new((sr * DIFFUSER_MAX_MS * 0.001) as usize * 2))
             }),
             diffuser_delay: [[1; LINES]; DIFFUSER_STEPS],
-            shimmer: std::array::from_fn(|n| PitchShifter::new(sr, 2.0, PRISM_MS, (LINES + n) as u32)),
+            shimmer: std::array::from_fn(|_| PitchShifter::new(sr, 2.0, PRISM_MS)),
             combs: std::array::from_fn(|_| Comb {
                 line: DelayLine::new((sr / TUNE_MIN_HZ) as usize + 8),
                 period: 2.0,
@@ -572,6 +732,8 @@ impl Engine {
             dry_mix: 1.0,
             comp: 1.0,
             comp_t: 1.0,
+            power: [0.0; 2],
+            k_power: [0.0; 2],
             a_s: 0.0,
             a_s_t: 0.0,
             a_t: 0.0,
@@ -618,6 +780,7 @@ impl Engine {
         self.frz.value = 0.0;
         self.tick = 0;
         self.env = 0.0;
+        self.power = [0.0; 2];
         self.stretch = 1.0;
         self.fresh = true;
         #[cfg(test)]
@@ -651,8 +814,6 @@ impl Engine {
             l.active = 0;
             l.fade = 0.0;
             l.jump = false;
-            l.lp = l.lp_t;
-            l.hp = l.hp_t;
             l.p = l.p_t;
         }
         self.a_s = self.a_s_t;
@@ -664,6 +825,8 @@ impl Engine {
         self.control();
         for l in &mut self.lines {
             l.g = l.g_t;
+            l.lp = l.lp_t;
+            l.hp = l.hp_t;
         }
         self.comp = self.comp_t;
     }
@@ -706,21 +869,24 @@ impl Engine {
             let spread = p.material * self.dna.damp[i];
             l.target = ms[i] * 0.001 * self.sr;
             l.t60 = p.decay_s * 2f32.powf(-spread);
-            l.lp_t = tone_pole(p.tone_hz * 2f32.powf(-2.0 * spread), self.sr);
-            l.hp_t = pole(p.low_cut_hz * 2f32.powf(spread), self.sr);
+            l.tone_hz = p.tone_hz * 2f32.powf(-2.0 * spread);
+            l.cut_hz = p.low_cut_hz * 2f32.powf(spread);
             l.p_t = ((p.prism - self.dna.prism_entry[i]) / PRISM_FADE).clamp(0.0, 1.0);
             let hz = walk_hz * self.dna.motion_rate[i];
             l.walk_inc = hz / self.sr;
             l.walk_coef = pole(hz, self.sr);
+            l.shifter.split = Split::new(land(l.shifter.ratio, &p), self.sr);
+        }
+        for shifter in &mut self.shimmer {
+            shifter.split = Split::new(land(shifter.ratio, &p), self.sr);
         }
         let ring_s = p.decay_s.clamp(0.5, 4.0);
         for comb in &mut self.combs {
             let ring_s = ring_s.min(TUNE_PERIODS * comb.period / self.sr);
             comb.g = 10f32.powf(-3.0 * comb.period / self.sr / ring_s);
         }
-        let over = (p.shimmer + p.tune * TUNE_MAX).max(1.0);
-        self.a_s_t = p.shimmer / over;
-        self.a_t_t = p.tune * TUNE_MAX / over;
+        self.a_s_t = p.shimmer;
+        self.a_t_t = p.tune;
         self.theta_t = p.diffuse * FRAC_PI_4;
         self.motion_depth_t = p.motion * p.motion * MOTION_S * self.sr;
         self.scatter_p = p.scatter * p.scatter * SCATTER_RATE / self.sr;
@@ -728,23 +894,35 @@ impl Engine {
 
     /// Length-dependent values, recomputed at control rate because Bloom and Scatter move lengths.
     fn control(&mut self) {
-        let shimmer_rows = (1.0 - self.a_s_t).powi(2) + SHIFT_ENERGY * self.a_s_t * self.a_s_t;
-        let tune_rows = (1.0 - self.a_t_t).powi(2);
-        let pass = (SHIMMER_ROWS.len() as f32 * shimmer_rows + TUNE_ROWS.len() as f32 * tune_rows) / LINES as f32;
-        let mut energy = 0.0;
+        let (mut kept, mut pass_s) = (0.0, 0.0);
+        // Shimmer lifts its share of the rows an octave on every pass.
+        let shimmer = 2f32.powf(self.a_s_t * SHIMMER_ROWS.len() as f32 / LINES as f32);
         for l in &mut self.lines {
             let h = l.heads[l.active];
             // The shifter's average read delay lengthens the pass.
-            let len_s = (h.base * h.scale * self.stretch + l.p_t * 0.5 * (1.0 + SHIFT_JITTER) * l.shifter.window) / self.sr;
-            let prism = (1.0 - l.p_t).powi(2) + SHIFT_ENERGY * l.p_t * l.p_t;
-            let g = 10f32.powf(-3.0 * len_s / l.t60);
-            // Makes up what the sounds take per pass so Decay keeps its meaning; the cap stays below 1.
-            let makeup = pass.powf(-0.5 * DECAY_MAKEUP) * prism.powf(-0.5 * PRISM_MAKEUP);
-            l.g_t = (g * makeup).min(g.powf(1.0 / MAKEUP_RING));
-            energy += l.g_t * l.g_t * pass * prism;
+            let len_s = (h.base * h.scale * self.stretch + l.p_t * 0.5 * (l.shifter.window + l.shifter.span)) / self.sr;
+            // No makeup for the sounds: their mixes keep the loop's power, so Decay alone sets the tail.
+            l.g_t = 10f32.powf(-3.0 * len_s / l.t60);
+            // A head Scatter pulled in passes the filters more often, so each pass takes less:
+            // damping stays a rate per second, like Decay.
+            let often = h.scale.sqrt();
+            // A shifting line damps as if before its shift, or whatever it lifts would land where Tone
+            // takes the most and die first.
+            let moved = l.shifter.ratio.max(0.5).powf(l.p_t);
+            l.lp_t = tone_pole(l.tone_hz / often * moved.max(1.0) * shimmer, self.sr);
+            l.hp_t = pole(l.cut_hz * often * moved.min(1.0), self.sr);
+            kept += l.g_t * l.g_t / LINES as f32;
+            pass_s += len_s / LINES as f32;
         }
+        // A steady input fills the loop to 1/(1 - kept) times its own power, a lone hit to once. `filled`
+        // tells the two apart, so both come out at one level whatever Decay is.
         // On the input, not the wet: lines stay under the limiter and a ringing tail never jumps.
-        self.comp_t = (1.0 - energy / LINES as f32).powf(0.5 * COMP_DEPTH);
+        let filled = (self.power[1] / (self.power[0] + 1e-20)).min(1.0);
+        self.comp_t = (1.0 + kept / (1.0 - kept) * filled).powf(-0.5 * COMP_DEPTH);
+        self.k_power = [
+            time_coef(COMP_FAST * pass_s * 1000.0, self.sr),
+            time_coef(self.params.decay_s * 1000.0 / 13.8, self.sr),
+        ];
         glide(&mut self.theta, self.theta_t, self.theta_coef);
         (self.s, self.c) = self.theta.sin_cos();
         // Equal power because the two paths are uncorrelated; 2θ runs 0..π/2 over the knob.
@@ -777,6 +955,9 @@ impl Engine {
         let bloom = self.bloom * (self.env * BLOOM_SENS).min(1.0);
         glide(&mut self.stretch, 1.0 + BLOOM_STRETCH * bloom, self.k_stretch);
         glide(&mut self.comp, self.comp_t, k);
+        let power = 0.5 * (input[0] * input[0] + input[1] * input[1]);
+        glide(&mut self.power[0], power, self.k_power[0]);
+        glide(&mut self.power[1], power, self.k_power[1]);
         glide(&mut self.a_s, self.a_s_t, k);
         glide(&mut self.a_t, self.a_t_t, k);
         glide(&mut self.width, self.params.width, k);
@@ -832,6 +1013,8 @@ impl Engine {
                 let old = l.heads[1 - active].base * l.heads[1 - active].scale * stretch;
                 let old = old + l.walk * depth.min(0.5 * old);
                 v += (l.delay.read(old) - v) * l.fade;
+                // Keeps the power of two heads that share nothing; a plain crossfade loses a third of it per jump.
+                v /= (1.0 - 2.0 * l.fade * (1.0 - l.fade) * (1.0 - l.rho)).sqrt();
                 l.fade = (l.fade - self.fade_step).max(0.0);
             } else {
                 let scatter = !freeze && self.scatter_p > 0.0 && (l.jump || self.rng.next() < self.scatter_p);
@@ -844,6 +1027,7 @@ impl Engine {
                     };
                     let base = if l.jump { l.target } else { l.heads[active].base };
                     l.heads[1 - active] = Head { base, scale };
+                    l.rho = l.delay.similarity(live, base * scale * stretch, 1.0 / (self.fade_step * SPLICE_POINTS as f32));
                     l.active = 1 - active;
                     l.fade = 1.0;
                     l.jump = false;
@@ -855,13 +1039,9 @@ impl Engine {
             let filtered = l.lp_z - l.hp_z;
             let filtered = filtered + (v - filtered) * frz;
 
-            l.shifter.line.write(filtered);
+            l.shifter.feed(filtered, duck);
             let p = l.p * duck * thaw;
-            let shaped = if p > 0.0 {
-                filtered + (l.shifter.read() - filtered) * p
-            } else {
-                filtered
-            };
+            let shaped = if p > 0.0 { l.shifter.mix(p) } else { filtered };
             x[i] = shaped;
             out[0] += shaped * l.pan[0];
             out[1] += shaped * l.pan[1];
@@ -870,29 +1050,28 @@ impl Engine {
         rotate(&mut x, c, s);
 
         // Written as Mx + a(inj - Mx): inj keeps the rest of Mx and swaps only the rows it taps,
-        // so ||inj|| <= ||x|| holds and the other lines keep the tail alive.
-        let (a_s, a_t) = (self.a_s * thaw, self.a_t * duck * thaw);
-        let direct = self.a_t / TUNE_MAX * TUNE_OUT;
+        // so the other lines keep the tail alive.
+        let a_s = self.a_s * thaw;
         let mut mixed = x;
         for (n, shifter) in self.shimmer.iter_mut().enumerate() {
             let row = &self.rows[SHIMMER_ROWS[n]];
             let tap: f32 = (0..LINES).map(|i| row[i] * x[i]).sum();
-            shifter.line.write(tap);
-            let delta = a_s * (shifter.read() - tap);
-            for i in 0..LINES {
-                mixed[i] += delta * row[i];
+            shifter.feed(tap, 1.0);
+            if a_s > 0.0 {
+                let delta = shifter.mix(a_s) - tap;
+                for i in 0..LINES {
+                    mixed[i] += delta * row[i];
+                }
             }
         }
+        let room = 1.0 - (1.0 - TUNE_ROOM) * self.a_t;
+        out = [out[0] * room, out[1] * room];
         for (n, comb) in self.combs.iter_mut().enumerate() {
             let row = &self.rows[TUNE_ROWS[n]];
             let tap: f32 = (0..LINES).map(|i| row[i] * x[i]).sum();
             let y = comb.tick(tap * duck);
             comb.lp_z = y + (comb.lp_z - y) * comb.lp;
-            out[n % 2] += TUNE_CEILING * soft_limit(direct * comb.lp_z / TUNE_CEILING);
-            let delta = a_t * (y - tap);
-            for i in 0..LINES {
-                mixed[i] += delta * row[i];
-            }
+            out[n % 2] += TUNE_CEILING * soft_limit(self.a_t * TUNE_OUT * comb.lp_z / TUNE_CEILING);
         }
 
         for i in 0..LINES {

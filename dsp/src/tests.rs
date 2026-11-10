@@ -428,8 +428,7 @@ fn sustained_level_stays_close_across_decay() {
         })
         .collect();
     eprintln!("sustained wet RMS {levels:?}, spread {:.2} dB", spread_db(&levels));
-    // Looser than full flattening on purpose, so hits still come through at long Decay.
-    assert!(spread_db(&levels) <= 9.0);
+    assert!(spread_db(&levels) <= 2.0);
 }
 
 #[test]
@@ -442,7 +441,7 @@ fn clicks_keep_their_peak_across_decay() {
         })
         .collect();
     eprintln!("click wet peak {:?} dB, spread {:.2} dB", peaks.iter().map(|&p| 20.0 * p.log10()).collect::<Vec<_>>(), spread_db(&peaks));
-    assert!(spread_db(&peaks) <= 7.0);
+    assert!(spread_db(&peaks) <= 2.0);
 }
 
 #[test]
@@ -713,7 +712,7 @@ fn sounds_keep_the_decay() {
         });
         t30(&ir)
     };
-    for decay_s in [3.0, 10.0] {
+    for decay_s in [3.0, 10.0, 30.0] {
         let base = EngineParams { decay_s, ..EngineParams::default() };
         let plain = tail(base);
         for (name, p) in [
@@ -724,14 +723,14 @@ fn sounds_keep_the_decay() {
         ] {
             let ratio = tail(p) / plain;
             eprintln!("decay {decay_s}: T30 plain {plain:.2} s, {name} at 0.5 keeps {:.0}%", ratio * 100.0);
-            assert!(ratio >= 0.7, "{decay_s} {name}: {ratio}");
+            assert!(ratio >= 0.75, "{decay_s} {name}: {ratio}");
         }
     }
 }
 
 /// Energy of a shifted sine within ±3 Hz of the target pitch over the rest of ±60 Hz, in dB.
 fn shifter_purity(hz: f32) -> f32 {
-    let mut s = PitchShifter::new(SR, 2.0, PRISM_MS, 0);
+    let mut s = PitchShifter::new(SR, 2.0, PRISM_MS);
     let mut src = sine(hz, 1.0);
     let out: Vec<[f32; 2]> = (0..secs(4.5))
         .map(|_| {
@@ -755,17 +754,17 @@ fn shifter_purity(hz: f32) -> f32 {
 
 #[test]
 fn shifter_lands_on_the_shifted_pitch() {
-    // Several inputs, because a fixed grain grid lands a line on 2f only for lucky frequencies.
+    // Several inputs, because unmatched splices land a line on 2f only for lucky frequencies.
     let purity: Vec<f32> = (0..9).map(|k| shifter_purity(400.0 + 10.0 * k as f32)).collect();
     eprintln!("shifter energy within ±3 Hz of 2f over the rest of ±60 Hz, 400..480 Hz in: {purity:.1?} dB");
-    assert!(purity.iter().all(|&p| p > -10.0), "{purity:?}");
+    assert!(purity.iter().all(|&p| p > 20.0), "{purity:?}");
 }
 
 #[test]
 fn reverse_shifter_plays_backward() {
     // A rising sawtooth played backward falls slowly and jumps up.
     for (ratio, ms) in [(-1.0, REVERSE_MS), (2.0, PRISM_MS)] {
-        let mut s = PitchShifter::new(SR, ratio, ms, 0);
+        let mut s = PitchShifter::new(SR, ratio, ms);
         let mut t = 0.0f32;
         let y: Vec<f32> = (0..secs(2.0))
             .map(|_| {
@@ -803,4 +802,74 @@ fn tune_catches_detuned_sources() {
     // The mean, because a sine on or between FDN modes reads many dB either way.
     eprintln!("tune at ±20 cents: mean {mean:+.1} dB vs off, {gains:.1?}");
     assert!(mean >= 6.0, "{gains:?}");
+}
+
+#[test]
+fn split_halves_keep_the_power() {
+    for hz in [200.0, 1000.0, 5000.0] {
+        let split = Split::new(hz, SR);
+        let mut z = [0.0; 3];
+        let mut src = noise(1.0);
+        let (mut input, mut low, mut high) = (0.0f64, 0.0f64, 0.0f64);
+        for _ in 0..secs(2.0) {
+            let x = src()[0];
+            let (l, h) = split.tick(x, &mut z);
+            input += (x * x) as f64;
+            low += (l * l) as f64;
+            high += (h * h) as f64;
+        }
+        // White noise below the crossover is 2 hz / SR of the total.
+        let share = low / input;
+        eprintln!("split {hz}: low + high = {:.4} of the input, low share {share:.4}", (low + high) / input);
+        assert!(((low + high) / input - 1.0).abs() < 0.01);
+        assert!((share / (2.0 * hz as f64 / SR as f64) - 1.0).abs() < 0.15, "{share}");
+    }
+}
+
+fn impulse_tail(p: EngineParams) -> f32 {
+    let mut e = engine(&p);
+    let mut first = true;
+    let ir = run(&mut e, secs(p.decay_s * 1.2), || {
+        let v = if first { 1.0 } else { 0.0 };
+        first = false;
+        [v, v]
+    });
+    t30(&ir)
+}
+
+#[test]
+fn prism_tail_holds_across_seeds() {
+    // Seeds 1 and 42 shift every line up, 2 mixes up and down, 9747 is mostly reverse.
+    let kept: Vec<f32> = [1, 42, 2, 9747]
+        .iter()
+        .map(|&seed| {
+            let base = EngineParams { decay_s: 10.0, seed, ..EngineParams::default() };
+            impulse_tail(EngineParams { prism: 1.0, ..base }) / impulse_tail(base)
+        })
+        .collect();
+    eprintln!("prism at max keeps {kept:.2?} of the plain T30");
+    assert!(kept.iter().all(|&k| k >= 0.65), "{kept:?}");
+    assert!(spread_db(&kept) <= 4.0, "{kept:?}");
+}
+
+#[test]
+fn steady_tone_stays_bounded_with_sounds() {
+    // The power-keeping mixes boost what looks uncorrelated; a tone that starts to ring must lose that boost.
+    let p = EngineParams {
+        decay_s: 30.0,
+        seed: 1,
+        shimmer: 0.5,
+        prism: 0.5,
+        scatter: 0.5,
+        motion: 0.0,
+        tone_hz: 20_000.0,
+        low_cut_hz: 20.0,
+        ..EngineParams::default()
+    };
+    let mut e = engine(&p);
+    let mut src = sine(220.0, 0.5);
+    run(&mut e, secs(39.0), &mut src);
+    let level = rms(&run(&mut e, secs(1.0), &mut src));
+    eprintln!("steady sine through shimmer, prism and scatter: wet RMS {level}, peak limiter input {}", e.peak_limit_in);
+    assert!(e.peak_limit_in < 1.0, "{}", e.peak_limit_in);
 }
