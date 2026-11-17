@@ -19,7 +19,9 @@ ditto --norsrc --noextattr --noqtn LICENSE "$stage/root/Library/Audio/Plug-Ins/S
 
 # Without this, Installer "relocates" onto any copy with the same bundle id, e.g. target/bundled
 pkgbuild --analyze --root "$stage/root" "$stage/components.plist"
-for i in 0 1; do
+# One entry per bundle -- counted, so adding a format later cannot silently skip the fix
+components=$(/usr/libexec/PlistBuddy -c "Print" "$stage/components.plist" | grep -c RootRelativeBundlePath)
+for i in $(seq 0 $((components - 1))); do
     /usr/libexec/PlistBuddy -c "Add :$i:BundleIsRelocatable bool false" "$stage/components.plist"
 done
 

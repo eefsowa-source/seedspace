@@ -14,3 +14,5 @@ jobs:
           components: clippy
       - run: cargo test --workspace
       - run: cargo clippy --workspace --all-targets
+      # The bundler config and the export macros are otherwise only exercised on one machine
+      - run: cargo xtask bundle seedspace --release

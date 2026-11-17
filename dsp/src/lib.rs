@@ -308,6 +308,9 @@ impl Ramp {
 }
 
 /// Fractional-delay ring buffer, power-of-two sized so wrapping is a mask.
+// shortcut: rounding to a power of two leaves 37 % unused (3.5 of 9.3 MB per instance at 48 kHz,
+// 14 of 37 at 192 kHz); a compare-wrap ring recovers it but puts a branch in every read.
+// Upgrade if instance count x memory becomes a real constraint.
 struct DelayLine {
     buf: Vec<f32>,
     mask: usize,

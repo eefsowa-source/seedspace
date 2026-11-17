@@ -59,6 +59,12 @@ impl Division {
     }
 }
 
+/// Equal power: the dry and wet paths are uncorrelated, so a linear fade would dip in the middle.
+fn mix_gains(mix: f32) -> (f32, f32) {
+    let theta = mix * std::f32::consts::FRAC_PI_2;
+    (theta.cos(), theta.sin())
+}
+
 fn synced_size_ms(division: Division, tempo: Option<f64>) -> f32 {
     let bpm = tempo
         .filter(|bpm| bpm.is_finite() && *bpm > 0.0)
@@ -316,9 +322,9 @@ impl Plugin for Seedspace {
             });
 
             for mut frame in block.iter_samples() {
-                let mix = p.mix.smoothed.next();
+                let (g_dry, g_wet) = mix_gains(p.mix.smoothed.next());
                 let gain = p.out.smoothed.next();
-                let out = |dry: f32, wet: f32| (dry + (wet - dry) * mix) * gain;
+                let out = |dry: f32, wet: f32| (dry * g_dry + wet * g_wet) * gain;
 
                 let mut channels = frame.iter_mut();
                 match (channels.next(), channels.next()) {
@@ -372,6 +378,19 @@ nih_export_vst3!(Seedspace);
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mix_holds_power_all_the_way_across() {
+        for mix in [0.0f32, 0.3, 0.5, 0.7, 1.0] {
+            let (g_dry, g_wet) = mix_gains(mix);
+            assert!((g_dry * g_dry + g_wet * g_wet - 1.0).abs() < 1e-6, "{mix}");
+        }
+        // The ends are exact enough that 0 % is dry and 100 % is wet.
+        let (dry, wet) = mix_gains(0.0);
+        assert!((dry - 1.0).abs() < 1e-6 && wet.abs() < 1e-6);
+        let (dry, wet) = mix_gains(1.0);
+        assert!(dry.abs() < 1e-6 && (wet - 1.0).abs() < 1e-6);
+    }
 
     #[test]
     fn sync_falls_back_to_120_bpm() {

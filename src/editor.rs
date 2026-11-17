@@ -403,7 +403,7 @@ fn knob<P: Param>(
 
     // Dice range handles, registered after the body so they win the hit test
     let decay_10s = p.decay.preview_normalized(10.0);
-    let (mut lo, mut hi, locked) = entry(&p.dice.read().unwrap(), id, decay_10s);
+    let (mut lo, mut hi, locked) = entry(&read_dice(p), id, decay_10s);
     let on_arc = |t: f32, r: f32| {
         let a = KNOB_START + KNOB_SWEEP * t;
         center + vec2(a.cos(), a.sin()) * r
@@ -425,10 +425,7 @@ fn knob<P: Param>(
         if lo > hi {
             std::mem::swap(&mut lo, &mut hi);
         }
-        p.dice
-            .write()
-            .unwrap()
-            .insert(id.to_string(), (lo, hi, locked));
+        write_dice(p, id.to_string(), (lo, hi, locked));
     }
 
     let painter = ui.painter();
@@ -483,7 +480,7 @@ fn knob<P: Param>(
 /// Painted padlock centered at `center`; closed and amber when Dice skips `id`.
 fn lock_toggle(ui: &mut Ui, center: Pos2, id: &str, p: &SeedspaceParams) {
     let decay_10s = p.decay.preview_normalized(10.0);
-    let (lo, hi, locked) = entry(&p.dice.read().unwrap(), id, decay_10s);
+    let (lo, hi, locked) = entry(&read_dice(p), id, decay_10s);
     let response = ui
         .interact(
             Rect::from_center_size(center, vec2(20.0, 20.0)),
@@ -496,10 +493,7 @@ fn lock_toggle(ui: &mut Ui, center: Pos2, id: &str, p: &SeedspaceParams) {
             "Lock to keep this when rolling Dice"
         });
     if response.clicked() {
-        p.dice
-            .write()
-            .unwrap()
-            .insert(id.to_string(), (lo, hi, !locked));
+        write_dice(p, id.to_string(), (lo, hi, !locked));
     }
     let color = if locked {
         RANGE
@@ -581,6 +575,18 @@ fn default_entry(id: &str, decay_10s: f32) -> (f32, f32, bool) {
     }
 }
 
+/// A poisoned lock means some other edit panicked; the stored ranges are lost but the editor
+/// keeps working instead of panicking on every frame from then on.
+fn read_dice(p: &SeedspaceParams) -> DiceRanges {
+    p.dice.read().map(|d| d.clone()).unwrap_or_default()
+}
+
+fn write_dice(p: &SeedspaceParams, id: String, range: (f32, f32, bool)) {
+    if let Ok(mut d) = p.dice.write() {
+        d.insert(id, range);
+    }
+}
+
 fn entry(dice: &DiceRanges, id: &str, decay_10s: f32) -> (f32, f32, bool) {
     dice.get(id)
         .copied()
@@ -614,7 +620,7 @@ fn dice(p: &SeedspaceParams, setter: &ParamSetter) {
     let state = nanos.wrapping_mul(0x9e37_79b9) | 1;
     let rolled = roll(
         &ids,
-        &p.dice.read().unwrap(),
+        &read_dice(p),
         p.decay.preview_normalized(10.0),
         state,
     );
