@@ -60,7 +60,9 @@ impl Division {
 }
 
 fn synced_size_ms(division: Division, tempo: Option<f64>) -> f32 {
-    let bpm = tempo.unwrap_or(120.0) as f32;
+    let bpm = tempo
+        .filter(|bpm| bpm.is_finite() && *bpm > 0.0)
+        .unwrap_or(120.0) as f32;
     (division.beats() * 60_000.0 / bpm).clamp(SIZE_MIN_MS, SIZE_MAX_MS)
 }
 
@@ -389,6 +391,17 @@ mod tests {
             synced_size_ms(Division::Sixteenth, Some(2000.0)),
             SIZE_MIN_MS
         );
+    }
+
+    #[test]
+    fn sync_ignores_invalid_tempo() {
+        for tempo in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 0.0, -120.0] {
+            assert_eq!(
+                synced_size_ms(Division::Eighth, Some(tempo)),
+                250.0,
+                "{tempo}"
+            );
+        }
     }
 
     #[test]

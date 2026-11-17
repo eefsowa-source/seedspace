@@ -320,10 +320,15 @@ fn space_map(ui: &mut Ui, rect: Rect, p: &SeedspaceParams) {
         font.clone(),
         TEXT_DIM,
     );
+    let length = if p.sync.value() {
+        "SYNC".to_owned()
+    } else {
+        format!("{:.0} ms", longest)
+    };
     painter.text(
         pos2(rect.max.x - 12.0, legend_y),
         Align2::RIGHT_CENTER,
-        format!("{:.0} ms", longest),
+        length,
         font,
         TEXT_DIM,
     );
@@ -353,8 +358,7 @@ fn knob<P: Param>(
     let drag_id = response.id.with("drag");
     if response.drag_started() {
         setter.begin_set_parameter(param);
-        let start = param.unmodulated_normalized_value();
-        ui.memory_mut(|m| m.data.insert_temp(drag_id, start));
+        ui.memory_mut(|m| m.data.insert_temp(drag_id, param.unmodulated_normalized_value()));
     }
     if response.dragged() {
         let current: f32 = ui

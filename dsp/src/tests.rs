@@ -385,6 +385,22 @@ fn seed_change_does_not_click() {
 }
 
 #[test]
+fn tune_full_seed_change_holds_through_the_swap() {
+    // Tune adds new notes after the swap, so a long max-step window measures content. This checks
+    // the 25 ms duck plus the fade back in, which is where a real discontinuity would land.
+    for (from, to) in [(1234, 77), (77, 4321), (5, 0), (9999, 1)] {
+        let p = EngineParams { seed: from, tune: 1.0, ..EngineParams::default() };
+        let mut e = engine(&p);
+        let mut src = sine(150.0, 0.5);
+        run(&mut e, secs(p.decay_s * 2.0), &mut src);
+        let before = max_step(&run(&mut e, secs(1.0), &mut src));
+        e.set_params(&EngineParams { seed: to, ..p });
+        let swap = max_step(&run(&mut e, secs(0.05), &mut src));
+        assert!(swap < 2.0 * before, "{from}->{to}: {swap} vs {before}");
+    }
+}
+
+#[test]
 fn rt60_matches_decay() {
     for decay_s in [0.5, 1.0, 3.0, 10.0, 30.0] {
         let p = EngineParams { decay_s, ..bare() };
